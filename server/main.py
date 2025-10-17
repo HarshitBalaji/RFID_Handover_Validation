@@ -50,6 +50,15 @@ class TelemetryModel(BaseModel):
     ts: int
     payload: dict
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # lock down to your host(s) later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.on_event("startup")
 async def startup():
     await database.connect()
