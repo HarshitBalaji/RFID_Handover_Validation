@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 
 // ----- Minimal React Single-File Frontend for the POC -----
 // Drop this into any Vite/CRA project OR serve via a simple React host.
@@ -6,10 +6,8 @@ import React, { useEffect, useMemo, useState } from "react";
 // - Configurable API base URL (persisted to localStorage)
 // - List orders
 // - Create order (POC: user-provided string)
-// - Generate receiver passkey
-// - Download audit CSV / export CSV
-// - Preview audit CSV / export CSV inline (client-side parsing)
-// - Status badges, simple toasts, and loading states
+// - Download/preview Audit CSV & Final Export CSV
+// - Status badges, status hints, simple toasts, and loading states
 // Styling: TailwindCSS classes (works even if Tailwind isn't present; it's still readable)
 // ---------------------------------------------------------------------------
 
@@ -31,8 +29,8 @@ function parseCSV(text) {
     } else {
       if (ch === '"') inQuotes = true;
       else if (ch === ',') pushField();
-      else if (ch === '\n') { pushField(); pushRow(); }
-      else if (ch === '\r') { /* ignore */ }
+      else if (ch === '')
+       { pushField(); pushRow(); }
       else field += ch;
     }
     i++;
@@ -65,6 +63,13 @@ const statusColor = (s) => ({
   IN_TRANSIT: "blue",
   DELIVERED: "green",
 }[s] || "gray");
+
+// Helper hint text per status
+const statusHint = (s) => ({
+  CREATED: "Next: Scan Sender tag at pickup to start tracking.",
+  IN_TRANSIT: "Next: Scan Receiver tag at delivery to complete the order.",
+  DELIVERED: "Order completed. Final export available.",
+}[s] || "");
 
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts);
@@ -129,15 +134,6 @@ export default function App() {
       loadOrders();
     } catch (e) {
       showToast(`Create failed: ${e.message}`, "err");
-    }
-  };
-
-  const genReceiver = async (orderId) => {
-    try {
-      await fetchJSON(`${apiBase}/generate_receiver_passkey/${orderId}`, { method: "POST" });
-      showToast("Receiver passkey generated", "ok");
-    } catch (e) {
-      showToast(`Generate failed: ${e.message}`, "err");
     }
   };
 
@@ -229,12 +225,16 @@ export default function App() {
                     <td className="px-3 py-2">{o.truck_id || <span className="text-slate-400">—</span>}</td>
                     <td className="px-3 py-2">{o.created_at || <span className="text-slate-400">—</span>}</td>
                     <td className="px-3 py-2">
+                      <div className="text-xs text-slate-500 mb-1">{statusHint(o.status)}</div>
                       <div className="flex flex-wrap gap-2">
-                        <button onClick={() => genReceiver(o.order_id)} className="px-3 py-1 rounded bg-indigo-600 text-white">Generate Receiver</button>
-                        <button onClick={() => openAuditPreview(o.order_id)} className="px-3 py-1 rounded bg-slate-700 text-white">Preview Audit</button>
-                        <button onClick={() => download(`${apiBase}/orders/${o.order_id}/audit/download`)} className="px-3 py-1 rounded border">Download Audit</button>
-                        <button onClick={() => openExportPreview(o.order_id)} className="px-3 py-1 rounded bg-teal-600 text-white">Preview Export</button>
-                        <button onClick={() => download(`${apiBase}/orders/${o.order_id}/export`)} className="px-3 py-1 rounded border">Download Export</button>
+                        <button onClick={() => openAuditPreview(o.order_id)} className="px-3 py-1 rounded bg-slate-700 text-white">View Audit</button>
+                        <button onClick={() => download(`${apiBase}/orders/${o.order_id}/audit/download`)} className="px-3 py-1 rounded border">Download Audit (CSV)</button>
+                        {o.status === 'DELIVERED' && (
+                          <>
+                            <button onClick={() => openExportPreview(o.order_id)} className="px-3 py-1 rounded bg-teal-600 text-white">View Final Export</button>
+                            <button onClick={() => download(`${apiBase}/orders/${o.order_id}/export`)} className="px-3 py-1 rounded border">Download Final Export (CSV)</button>
+                          </>
+                        )}
                       </div>
                     </td>
                   </tr>
