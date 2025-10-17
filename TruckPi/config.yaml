@@ -5,3 +5,8 @@ mqtt_topic_scan: "boxes/+/scan"
 server_rest: "http://<SERVER_IP_OR_HOST>:8000"
 truck_id: "truck-001"
 local_db: "truck_local.db"
+
+gps:
+  source: "fixed"
+  fixed_lat: 12.9716
+  fixed_lon: 77.5946
