@@ -1,0 +1,7 @@
+server_host: "0.0.0.0"
+server_port: 8000
+db_path: "sqlite:///./poc_server.db"
+server_privkey_pem: "server_priv.pem"
+server_pubkey_pem: "server_pub.pem"
+passkey_ttl_minutes: 90
+passkey_folder: "passkeys"
