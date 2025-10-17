@@ -5,3 +5,7 @@ server_privkey_pem: "server_priv.pem"
 server_pubkey_pem: "server_pub.pem"
 passkey_ttl_minutes: 90
 passkey_folder: "passkeys"
+
+server_sampling_seconds: 240   # Server logs every 4 minutes (half the Truck frequency if Truck ~2 min)
+logs_dir: "logs"
+exports_dir: "exports"

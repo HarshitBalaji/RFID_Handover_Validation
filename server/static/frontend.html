@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>POC - Orders & Telemetry</title>
+  <style>
+    body{font-family:Arial;margin:20px}
+    .order{border:1px solid #ddd;padding:10px;margin-bottom:10px}
+    .telemetry{font-family:monospace;background:#f9f9f9;padding:8px}
+    button{margin-top:6px}
+  </style>
+</head>
+<body>
+  <h2>Orders</h2>
+  <div id="orders"></div>
+
+  <script>
+    async function fetchOrders(){
+      const res = await fetch('/orders');
+      const data = await res.json();
+      const container = document.getElementById('orders');
+      container.innerHTML = '';
+      for(const o of data.orders){
+        const div = document.createElement('div');
+        div.className = 'order';
+        div.innerHTML = `<b>${o.order_id}</b> — status: ${o.status} — box: ${o.box_id || '-'} — truck: ${o.truck_id || '-'}
+          <div><button onclick="showTelemetry('${o.order_id}')">Show last telemetry</button>
+          <button onclick="downloadAudit('${o.order_id}')">Download audit log</button></div>
+          <div id="tel_${o.order_id}" class="telemetry" style="display:none"></div>`;
+        container.appendChild(div);
+      }
+    }
+
+    async function showTelemetry(orderId){
+      const el = document.getElementById('tel_' + orderId);
+      el.style.display = 'block';
+      el.innerText = 'Loading...';
+      // simple endpoint to fetch last 20 telemetry rows (not implemented server-side) — fallback: query telemetry via /telemetry_query?order_id=
+      const res = await fetch(`/telemetry_query?order_id=${orderId}`);
+      const data = await res.json();
+      el.innerText = JSON.stringify(data, null, 2);
+    }
+
+    async function downloadAudit(orderId){
+      window.location = `/orders/${orderId}/audit/download`;
+    }
+
+    // initial load
+    fetchOrders();
+    // refresh every 8s
+    setInterval(fetchOrders, 8000);
+  </script>
+</body>
+</html>

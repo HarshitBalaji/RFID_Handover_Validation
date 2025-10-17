@@ -1,3 +1,9 @@
+# --- PATCHED: models.py ---
+# No breaking changes. Kept schema stable.
+# Notes:
+# - Status values remain: CREATED, IN_TRANSIT, DELIVERED (DELIVERED == completed).
+# - Telemetry kept for downsampled server persistence.
+
 from sqlalchemy import (
     Table, Column, Integer, String, MetaData, DateTime, Text
 )

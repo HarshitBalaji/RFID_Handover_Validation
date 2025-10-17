@@ -183,5 +183,5 @@ async def download_audit_log(order_id: str):
 # Simple frontend page
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    with open("static/front.html", "r", encoding="utf-8") as f:
+    with open("static/frontend.html", "r", encoding="utf-8") as f:
         return f.read()

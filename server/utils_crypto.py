@@ -1,3 +1,4 @@
+# --- UNCHANGED: utils_crypto.py ---
 import json, base64
 from datetime import datetime, timedelta
 from cryptography.hazmat.primitives import hashes, serialization
@@ -26,6 +27,5 @@ def create_passkey_string(priv_key, order_id: str, role: str, ttl_minutes: int =
         "expires_at": (now + timedelta(minutes=ttl_minutes)).isoformat() + "Z"
     }
     sig = sign_payload(priv_key, payload)
-    # store signature as base64 for a compact token
     token = base64.urlsafe_b64encode(sig).decode().rstrip("=")
     return token, payload
