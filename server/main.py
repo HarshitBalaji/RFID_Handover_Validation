@@ -108,44 +108,142 @@ async def generate_receiver_passkey(order_id: str):
 async def validate_scan(v: ValidateScanModel):
     row = await database.fetch_one(orders.select().where(orders.c.order_id == v.order_id))
     if not row:
-        await database.execute(audit_log.insert().values(order_id=v.order_id, device_id=v.device_chain.get("box_id"), event_type="validate_failed", remarks="order_not_found"))
+        await database.execute(audit_log.insert().values(
+            order_id=v.order_id,
+            device_id=v.device_chain.get("box_id"),
+            event_type="validate_failed",
+            remarks="order_not_found"
+        ))
         raise HTTPException(404, "order not found")
+
     # prevent replay: check used_passkeys
     used = await database.fetch_one(used_passkeys.select().where(used_passkeys.c.passkey_string == v.passkey_string))
     if used:
-        await database.execute(audit_log.insert().values(order_id=v.order_id, device_id=v.device_chain.get("box_id"), event_type="validate_failed", remarks="replay"))
+        await database.execute(audit_log.insert().values(
+            order_id=v.order_id,
+            device_id=v.device_chain.get("box_id"),
+            event_type="validate_failed",
+            remarks="replay"
+        ))
         raise HTTPException(400, "passkey already used")
-    # check matches sender or receiver
+
+    box_id = v.device_chain.get("box_id")
+    truck_id = v.device_chain.get("truck_id")
+
+    # sender scan -> CREATED -> IN_TRANSIT, set box/truck and keep them
     if v.passkey_string == row["sender_passkey_string"]:
-        # sender scanned => we expect status CREATED; attach box_id and truck_id and set IN_TRANSIT
         if row["status"] != "CREATED":
-            await database.execute(audit_log.insert().values(order_id=v.order_id, device_id=v.device_chain.get("box_id"), event_type="validate_failed", remarks="unexpected_state_for_sender"))
+            await database.execute(audit_log.insert().values(
+                order_id=v.order_id,
+                device_id=box_id,
+                event_type="validate_failed",
+                remarks="unexpected_state_for_sender"
+            ))
             raise HTTPException(400, f"order in unexpected state {row['status']}")
-        # set box_id and truck_id
-        await database.execute(orders.update().where(orders.c.order_id == v.order_id).values(box_id=v.device_chain.get("box_id"), truck_id=v.device_chain.get("truck_id"), status="IN_TRANSIT"))
+
+        # Attach identifiers and move to IN_TRANSIT
+        await database.execute(
+            orders.update()
+            .where(orders.c.order_id == v.order_id)
+            .values(box_id=box_id, truck_id=truck_id, status="IN_TRANSIT")
+        )
+
         await database.execute(used_passkeys.insert().values(passkey_string=v.passkey_string))
-        await database.execute(audit_log.insert().values(order_id=v.order_id, device_id=v.device_chain.get("box_id"), event_type="sender_validated", remarks=f"truck:{v.device_chain.get('truck_id')}"))
+
+        # Rich JSON remarks (includes both truck_id and box_id)
+        await database.execute(audit_log.insert().values(
+            order_id=v.order_id,
+            device_id=box_id,
+            event_type="sender_validated",
+            remarks=json.dumps({"truck_id": truck_id, "box_id": box_id})
+        ))
         return {"ok": True, "order_id": v.order_id, "transition": "IN_TRANSIT"}
+
+    # receiver scan -> IN_TRANSIT -> DELIVERED, KEEP box/truck in DB for audit
     elif v.passkey_string == row["receiver_passkey_string"]:
-        # receiver scanned => expect IN_TRANSIT -> DELIVERED and remove assignment (clear box_id/truck_id)
         if row["status"] != "IN_TRANSIT":
-            await database.execute(audit_log.insert().values(order_id=v.order_id, device_id=v.device_chain.get("box_id"), event_type="validate_failed", remarks="unexpected_state_for_receiver"))
+            await database.execute(audit_log.insert().values(
+                order_id=v.order_id,
+                device_id=box_id,
+                event_type="validate_failed",
+                remarks="unexpected_state_for_receiver"
+            ))
             raise HTTPException(400, f"order in unexpected state {row['status']}")
-        await database.execute(orders.update().where(orders.c.order_id == v.order_id).values(status="DELIVERED", box_id=None, truck_id=None))
+
+        # IMPORTANT: do NOT clear box_id/truck_id; we keep them for audit lineage
+        await database.execute(
+            orders.update()
+            .where(orders.c.order_id == v.order_id)
+            .values(status="DELIVERED")
+        )
+
         await database.execute(used_passkeys.insert().values(passkey_string=v.passkey_string))
-        await database.execute(audit_log.insert().values(order_id=v.order_id, device_id=v.device_chain.get("box_id"), event_type="receiver_validated", remarks=f"truck:{v.device_chain.get('truck_id')}"))
+
+        await database.execute(audit_log.insert().values(
+            order_id=v.order_id,
+            device_id=box_id,
+            event_type="receiver_validated",
+            remarks=json.dumps({"truck_id": truck_id, "box_id": box_id})
+        ))
         return {"ok": True, "order_id": v.order_id, "transition": "DELIVERED"}
+
     else:
-        await database.execute(audit_log.insert().values(order_id=v.order_id, device_id=v.device_chain.get("box_id"), event_type="validate_failed", remarks="bad_passkey"))
+        await database.execute(audit_log.insert().values(
+            order_id=v.order_id,
+            device_id=box_id,
+            event_type="validate_failed",
+            remarks="bad_passkey"
+        ))
         raise HTTPException(400, "invalid passkey")
 
 # 4) telemetry endpoint — truck forwards only telemetry for attached boxes; server stores telemetry with order_id if present
 @app.post("/telemetry_upload")
 async def telemetry_upload(t: TelemetryModel):
-    # payload should contain order_id if truck attached it; but we'll persist whatever truck sends
-    order_id = t.payload.get("order_id")
-    await database.execute(telemetry.insert().values(order_id=order_id, device_id=t.device_id, ts=t.ts, payload=json.dumps(t.payload)))
-    await database.execute(audit_log.insert().values(order_id=order_id, device_id=t.device_id, event_type="telemetry", remarks=json.dumps({"ts": t.ts})))
+    # Always persist the raw payload as-is
+    p = t.payload or {}
+
+    # Prefer order_id from payload; keep behavior consistent with your DB
+    order_id = p.get("order_id")
+
+    # Extract telemetry values (robust to both nested-only and top-level duplicates)
+    # agent may send only in payload, or also send duplicates like truck_lat/truck_lon/gps
+    def _get_latlon(obj):
+        lat = obj.get("lat") or obj.get("truck_lat")
+        lon = obj.get("lon") or obj.get("truck_lon")
+        if not lat or not lon:
+            gps_obj = obj.get("gps") or {}
+            lat = lat or gps_obj.get("lat")
+            lon = lon or gps_obj.get("lon")
+        return lat, lon
+
+    temperature = p.get("temperature")
+    lat, lon = _get_latlon(p)
+
+    # Persist telemetry table (unchanged)
+    await database.execute(
+        telemetry.insert().values(
+            order_id=order_id,
+            device_id=t.device_id,
+            ts=t.ts,
+            payload=json.dumps(p),
+        )
+    )
+
+    # Enrich the audit row so CSV can expose telemetry columns
+    audit_payload = {
+        "ts": t.ts,
+        "temperature": temperature,
+        "truck_lat": lat,
+        "truck_lon": lon,
+    }
+    await database.execute(
+        audit_log.insert().values(
+            order_id=order_id,
+            device_id=t.device_id,
+            event_type="telemetry",
+            remarks=json.dumps(audit_payload),
+        )
+    )
     return {"ok": True}
 
 # 5) get orders list (hide passkeys)
@@ -179,15 +277,78 @@ async def get_order(order_id: str):
 # 6) Download audit log CSV for an order
 @app.get("/orders/{order_id}/audit/download")
 async def download_audit_log(order_id: str):
-    rows = await database.fetch_all(audit_log.select().where(audit_log.c.order_id == order_id).order_by(audit_log.c.event_ts))
+    # Fetch the order row once; its box_id/truck_id are retained even after delivery
+    order_row = await database.fetch_one(orders.select().where(orders.c.order_id == order_id))
+    order_truck_id = order_row["truck_id"] if order_row else None
+    order_box_id = order_row["box_id"] if order_row else None
+
+    rows = await database.fetch_all(
+        audit_log.select()
+        .where(audit_log.c.order_id == order_id)
+        .order_by(audit_log.c.event_ts)
+    )
+
     output = StringIO()
     w = csv.writer(output)
-    w.writerow(["event_ts", "event_type", "device_id", "remarks"])
+    # New columns truck_id, box_id; keep telemetry columns too
+    w.writerow(["event_ts", "event_type", "device_id", "order_id",
+                "truck_id", "box_id",
+                "temperature", "truck_lat", "truck_lon", "remarks"])
+
     for r in rows:
-        w.writerow([r["event_ts"].isoformat() if r["event_ts"] else "", r["event_type"], r["device_id"], (r["remarks"] or "")])
+        remarks_raw = r["remarks"] or ""
+        temperature = ""
+        truck_lat = ""
+        truck_lon = ""
+        csv_truck_id = order_truck_id
+        csv_box_id = order_box_id
+
+        # Try to parse remarks as JSON to override/add truck/box and telemetry
+        try:
+            robj = json.loads(remarks_raw) if remarks_raw else {}
+        except Exception:
+            robj = {}
+
+        # For sender/receiver validations we stored {"truck_id","box_id"}
+        if isinstance(robj, dict):
+            if robj.get("truck_id") is not None:
+                csv_truck_id = robj.get("truck_id")
+            if robj.get("box_id") is not None:
+                csv_box_id = robj.get("box_id")
+
+        # For telemetry we stored telemetry fields in remarks JSON
+        if r["event_type"] == "telemetry" and isinstance(robj, dict):
+            if robj.get("temperature") is not None:
+                temperature = robj.get("temperature")
+            truck_lat = robj.get("truck_lat") if robj.get("truck_lat") is not None else truck_lat
+            truck_lon = robj.get("truck_lon") if robj.get("truck_lon") is not None else truck_lon
+            # tolerant fallbacks
+            if not truck_lat:
+                truck_lat = robj.get("lat")
+            if not truck_lon:
+                truck_lon = robj.get("lon")
+
+        w.writerow([
+            r["event_ts"].isoformat() if r["event_ts"] else "",
+            r["event_type"],
+            r["device_id"],
+            r["order_id"],
+            csv_truck_id or "",
+            csv_box_id or "",
+            temperature if temperature is not None else "",
+            truck_lat if truck_lat is not None else "",
+            truck_lon if truck_lon is not None else "",
+            remarks_raw
+        ])
+
     output.seek(0)
     filename = f"audit_{order_id}.csv"
-    return StreamingResponse(iter([output.read()]), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
+    return StreamingResponse(
+        iter([output.read()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
 
 # Simple frontend page
 @app.get("/", response_class=HTMLResponse)

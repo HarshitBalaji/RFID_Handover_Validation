@@ -1,25 +1,21 @@
 import React, { useEffect, useState } from "react";
+import "./poc.css"; // ← add this line
 
-// ----- Minimal React Single-File Frontend for the POC -----
-// Drop this into any Vite/CRA project OR serve via a simple React host.
-// Features:
+// ----- Minimal React Single-File Frontend for the POC (Styled) -----
 // - Configurable API base URL (persisted to localStorage)
 // - List orders
-// - Create order (POC: user-provided string)
-// - Download/preview Audit CSV & Final Export CSV
-// - Status badges, status hints, simple toasts, and loading states
-// Styling: TailwindCSS classes (works even if Tailwind isn't present; it's still readable)
-// ---------------------------------------------------------------------------
+// - Create order
+// - Download/preview Audit CSV
+// - Status badges, hints, toasts, loading/skeleton states
+// ---------------------------------------------------------------
 
-// Small CSV parser (no external deps)
+// Small CSV parser (robust to CRLF and quoted fields)
 function parseCSV(text) {
   const rows = [];
-  let i = 0;
-  let field = "";
-  let row = [];
-  let inQuotes = false;
+  let i = 0, field = "", row = [], inQuotes = false;
   const pushField = () => { row.push(field); field = ""; };
   const pushRow = () => { rows.push(row); row = []; };
+
   while (i < text.length) {
     const ch = text[i];
     if (inQuotes) {
@@ -28,10 +24,13 @@ function parseCSV(text) {
       } else { field += ch; }
     } else {
       if (ch === '"') inQuotes = true;
-      else if (ch === ',') pushField();
-      else if (ch === '')
-       { pushField(); pushRow(); }
-      else field += ch;
+      else if (ch === ",") pushField();
+      else if (ch === "\n") { pushField(); pushRow(); }
+      else if (ch === "\r") {
+        // handle CRLF
+        if (text[i + 1] === "\n") { i++; }
+        pushField(); pushRow();
+      } else field += ch;
     }
     i++;
   }
@@ -40,21 +39,19 @@ function parseCSV(text) {
 }
 
 function Badge({ children, color = "blue" }) {
-  const cls = {
-    blue: "bg-blue-100 text-blue-800",
-    green: "bg-green-100 text-green-800",
-    yellow: "bg-yellow-100 text-yellow-800",
-    gray: "bg-gray-100 text-gray-800",
-    red: "bg-red-100 text-red-800",
-  }[color] || "bg-gray-100 text-gray-800";
-  return <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${cls}`}>{children}</span>;
+  return <span className={`badge badge--${color}`}>{children}</span>;
 }
 
 function useLocalStorage(key, initial) {
   const [val, setVal] = useState(() => {
-    const v = localStorage.getItem(key); return v ? JSON.parse(v) : initial;
+    try {
+      const v = localStorage.getItem(key);
+      return v ? JSON.parse(v) : initial;
+    } catch { return initial; }
   });
-  useEffect(() => { localStorage.setItem(key, JSON.stringify(val)); }, [key, val]);
+  useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+  }, [key, val]);
   return [val, setVal];
 }
 
@@ -64,7 +61,6 @@ const statusColor = (s) => ({
   DELIVERED: "green",
 }[s] || "gray");
 
-// Helper hint text per status
 const statusHint = (s) => ({
   CREATED: "Next: Scan Sender tag at pickup to start tracking.",
   IN_TRANSIT: "Next: Scan Receiver tag at delivery to complete the order.",
@@ -84,12 +80,17 @@ async function fetchText(url) {
 }
 
 function Toast({ text, kind = "info" }) {
-  const colors = {
-    info: "bg-slate-800 text-white",
-    ok: "bg-emerald-600 text-white",
-    err: "bg-rose-600 text-white",
-  };
-  return <div className={`fixed bottom-4 right-4 px-4 py-2 rounded-lg shadow ${colors[kind]}`}>{text}</div>;
+  return <div className={`toast toast--${kind}`}>{text}</div>;
+}
+
+function Skeleton({ rows = 5 }) {
+  return (
+    <div className="skeleton">
+      {Array.from({ length: rows }).map((_, i) => (
+        <div key={i} className="skeleton__row" />
+      ))}
+    </div>
+  );
 }
 
 export default function App() {
@@ -104,7 +105,8 @@ export default function App() {
 
   const showToast = (text, kind = "info", ms = 2200) => {
     setToast({ text, kind });
-    setTimeout(() => setToast(null), ms);
+    window.clearTimeout(showToast._t);
+    showToast._t = window.setTimeout(() => setToast(null), ms);
   };
 
   const loadOrders = async () => {
@@ -119,7 +121,7 @@ export default function App() {
     }
   };
 
-  useEffect(() => { loadOrders(); }, [apiBase]);
+  useEffect(() => { loadOrders(); /* eslint-disable-next-line */ }, [apiBase]);
 
   const createOrder = async () => {
     if (!newOrderId.trim()) { showToast("Enter an order id", "err"); return; }
@@ -155,92 +157,90 @@ export default function App() {
     }
   };
 
-  const openExportPreview = async (orderId) => {
-    try {
-      const text = await fetchText(`${apiBase}/orders/${orderId}/export`);
-      const rows = parseCSV(text);
-      if (!rows.length) { showToast("Empty export", "info"); return; }
-      const [headers, ...rest] = rows;
-      setCsvPreview({ title: `Export – ${orderId}`, headers, rows: rest });
-      setCsvOpen(true);
-    } catch (e) {
-      showToast(`Export fetch failed: ${e.message}`, "err");
-    }
-  };
-
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="sticky top-0 z-10 bg-white border-b">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="font-semibold text-lg">Cold-Chain Handover POC</div>
-          <div className="flex items-center gap-2">
-            <input
-              className="border rounded px-3 py-1 text-sm w-72"
-              value={apiBase}
-              onChange={(e) => setApiBase(e.target.value)}
-              placeholder="http://127.0.0.1:8000"
-            />
-            <button onClick={loadOrders} className="px-3 py-1 rounded bg-slate-800 text-white text-sm">Reload</button>
+    <div className="app">
+      <header className="header">
+        <div className="container header__inner">
+          <div className="brand">
+            <div className="brand__logo">❄️</div>
+            <div className="brand__title">Cold-Chain Handover POC</div>
+          </div>
+          <div className="header__controls">
+            <div className="input-group">
+              <label className="label">API Base</label>
+              <input
+                className="input"
+                value={apiBase}
+                onChange={(e) => setApiBase(e.target.value)}
+                placeholder="http://127.0.0.1:8000"
+              />
+            </div>
+            <button onClick={loadOrders} className="btn btn--dark">Reload</button>
           </div>
         </div>
       </header>
 
-      <main className="max-w-5xl mx-auto px-4 py-6 space-y-8">
+      <main className="container space-y">
         {/* Create Order */}
-        <section className="bg-white rounded-2xl shadow p-4">
-          <div className="flex items-end gap-3">
-            <div className="flex-1">
-              <label className="block text-xs text-slate-500">New Order ID</label>
-              <input className="border rounded w-full px-3 py-2" value={newOrderId} onChange={e => setNewOrderId(e.target.value)} placeholder="e.g. ORDER123" />
+        <section className="card">
+          <div className="card__grid">
+            <div className="input-group">
+              <label className="label">New Order ID</label>
+              <input
+                className="input"
+                value={newOrderId}
+                onChange={e => setNewOrderId(e.target.value)}
+                placeholder="e.g. ORDER123"
+              />
+              <div className="hint">Creates the order and issues a Sender passkey JSON on the server.</div>
             </div>
-            <button onClick={createOrder} className="px-4 py-2 rounded bg-emerald-600 text-white">Create</button>
+            <div className="card__actions">
+              <button onClick={createOrder} className="btn btn--primary">Create</button>
+            </div>
           </div>
-          <p className="text-xs text-slate-500 mt-2">Creates order in state <strong>CREATED</strong> and issues Sender passkey JSON file on the server.</p>
         </section>
 
         {/* Orders List */}
-        <section className="bg-white rounded-2xl shadow p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-semibold">Orders</h2>
-            {loading && <span className="text-xs text-slate-500">Loading…</span>}
+        <section className="card">
+          <div className="card__header">
+            <h2 className="card__title">Orders</h2>
+            {loading && <span className="muted">Loading…</span>}
           </div>
-          <div className="overflow-auto">
-            <table className="min-w-full text-sm">
+
+          <div className="table-wrap">
+            <table className="table">
               <thead>
-                <tr className="text-left bg-slate-100">
-                  <th className="px-3 py-2">Order ID</th>
-                  <th className="px-3 py-2">Status</th>
-                  <th className="px-3 py-2">Box</th>
-                  <th className="px-3 py-2">Truck</th>
-                  <th className="px-3 py-2">Created</th>
-                  <th className="px-3 py-2">Actions</th>
+                <tr>
+                  <th>Order ID</th>
+                  <th>Status</th>
+                  <th>Box</th>
+                  <th>Truck</th>
+                  <th>Created</th>
+                  <th style={{ width: 340 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {orders.map((o) => (
-                  <tr key={o.order_id} className="border-t">
-                    <td className="px-3 py-2 font-mono">{o.order_id}</td>
-                    <td className="px-3 py-2"><Badge color={statusColor(o.status)}>{o.status}</Badge></td>
-                    <td className="px-3 py-2">{o.box_id || <span className="text-slate-400">—</span>}</td>
-                    <td className="px-3 py-2">{o.truck_id || <span className="text-slate-400">—</span>}</td>
-                    <td className="px-3 py-2">{o.created_at || <span className="text-slate-400">—</span>}</td>
-                    <td className="px-3 py-2">
-                      <div className="text-xs text-slate-500 mb-1">{statusHint(o.status)}</div>
-                      <div className="flex flex-wrap gap-2">
-                        <button onClick={() => openAuditPreview(o.order_id)} className="px-3 py-1 rounded bg-slate-700 text-white">View Audit</button>
-                        <button onClick={() => download(`${apiBase}/orders/${o.order_id}/audit/download`)} className="px-3 py-1 rounded border">Download Audit (CSV)</button>
-                        {o.status === 'DELIVERED' && (
-                          <>
-                            <button onClick={() => openExportPreview(o.order_id)} className="px-3 py-1 rounded bg-teal-600 text-white">View Final Export</button>
-                            <button onClick={() => download(`${apiBase}/orders/${o.order_id}/export`)} className="px-3 py-1 rounded border">Download Final Export (CSV)</button>
-                          </>
-                        )}
+                {!loading && orders.map((o) => (
+                  <tr key={o.order_id}>
+                    <td className="mono">{o.order_id}</td>
+                    <td><Badge color={statusColor(o.status)}>{o.status}</Badge></td>
+                    <td>{o.box_id || <span className="muted">—</span>}</td>
+                    <td>{o.truck_id || <span className="muted">—</span>}</td>
+                    <td>{o.created_at || <span className="muted">—</span>}</td>
+                    <td>
+                      <div className="hint">{statusHint(o.status)}</div>
+                      <div className="actions">
+                        <button onClick={() => openAuditPreview(o.order_id)} className="btn btn--dark">View Audit</button>
+                        <button onClick={() => download(`${apiBase}/orders/${o.order_id}/audit/download`)} className="btn btn--outline">Download CSV</button>
                       </div>
                     </td>
                   </tr>
                 ))}
-                {!orders.length && (
-                  <tr><td className="px-3 py-6 text-center text-slate-400" colSpan={6}>No orders found</td></tr>
+                {loading && (
+                  <tr><td colSpan={6}><Skeleton rows={6} /></td></tr>
+                )}
+                {!loading && !orders.length && (
+                  <tr><td className="center muted" colSpan={6}>No orders found</td></tr>
                 )}
               </tbody>
             </table>
@@ -249,29 +249,27 @@ export default function App() {
 
         {/* CSV Preview Modal */}
         {csvOpen && (
-          <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-20">
-            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[80vh] flex flex-col">
-              <div className="px-4 py-3 border-b flex items-center justify-between">
-                <div className="font-semibold">{csvPreview.title}</div>
-                <button className="px-3 py-1 rounded bg-slate-800 text-white" onClick={() => setCsvOpen(false)}>Close</button>
+          <div className="modal" onClick={() => setCsvOpen(false)}>
+            <div className="modal__dialog" onClick={(e) => e.stopPropagation()}>
+              <div className="modal__header">
+                <div className="modal__title">{csvPreview.title}</div>
+                <button className="btn btn--dark" onClick={() => setCsvOpen(false)}>Close</button>
               </div>
-              <div className="p-4 overflow-auto">
-                <table className="min-w-full text-xs">
-                  <thead>
-                    <tr>
-                      {csvPreview.headers.map((h, i) => (
-                        <th key={i} className="text-left px-2 py-1 bg-slate-100 sticky top-0">{h}</th>
+              <div className="modal__body">
+                <div className="table-wrap">
+                  <table className="table table--compact">
+                    <thead>
+                      <tr>{csvPreview.headers.map((h, i) => <th key={i}>{h}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {csvPreview.rows.map((r, i) => (
+                        <tr key={i}>
+                          {r.map((c, j) => <td key={j}>{c}</td>)}
+                        </tr>
                       ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {csvPreview.rows.map((r, i) => (
-                      <tr key={i} className="border-t">
-                        {r.map((c, j) => <td key={j} className="px-2 py-1 align-top">{c}</td>)}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </div>
@@ -279,6 +277,7 @@ export default function App() {
       </main>
 
       {toast && <Toast text={toast.text} kind={toast.kind} />}
+      <footer className="footer">© {new Date().getFullYear()} Cold-Chain POC</footer>
     </div>
   );
 }
