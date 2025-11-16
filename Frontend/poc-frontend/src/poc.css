@@ -138,3 +138,60 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-seri
 .footer{
   margin:28px 0; text-align:center; color:var(--muted); font-size:12px;
 }
+
+.temp {
+  padding: 0.15rem 0.4rem;
+  border-radius: 0.35rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.temp--ok { background: rgba(16,185,129,0.15); color: #065f46; }
+.temp--warn { background: rgba(234,179,8,0.18); color: #92400e; }
+.temp--bad { background: rgba(239,68,68,0.18); color: #991b1b; }
+
+.legend {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+.legend__item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+.legend__swatch {
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 0.2rem;
+  display: inline-block;
+}
+.swatch--ok { background: rgba(16,185,129,0.6); }
+.swatch--warn { background: rgba(234,179,8,0.7); }
+.swatch--bad { background: rgba(239,68,68,0.7); }
+
+/* Force consistent input field text and background colors */
+input.input,
+select.input,
+textarea.input {
+  color: #000 !important;           /* always black text */
+  background-color: #fff !important; /* white background */
+  border: 1px solid #ccc;           /* subtle border */
+}
+
+input.input::placeholder,
+textarea.input::placeholder {
+  color: #666;                      /* darker gray placeholder for contrast */
+  opacity: 1;
+}
+
+/* optional: hover and focus feedback */
+input.input:focus,
+select.input:focus,
+textarea.input:focus {
+  outline: none;
+  border-color: #646cff;            /* highlight same as your theme */
+  box-shadow: 0 0 3px rgba(100, 108, 255, 0.5);
+}
