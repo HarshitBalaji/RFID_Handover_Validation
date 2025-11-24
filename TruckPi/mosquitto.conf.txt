@@ -1,0 +1,25 @@
+# Place your local configuration in /etc/mosquitto/conf.d/
+#
+# A full description of the configuration file is at
+# /usr/share/doc/mosquitto/examples/mosquitto.conf.example
+
+# TLS listener on 1883
+listener 8883
+cafile /etc/mosquitto/certs/ca.crt
+certfile /etc/mosquitto/certs/mqtt_broker.crt
+keyfile /etc/mosquitto/certs/mqtt_broker.key
+
+#For POC only, to be removed in actual production
+require_certificate false 
+
+#pid_file /run/mosquitto/mosquitto.pid
+
+persistence true
+persistence_location /var/lib/mosquitto/
+
+log_dest file /var/log/mosquitto/mosquitto.log
+
+include_dir /etc/mosquitto/conf.d
+
+#For POC only
+allow_anonymous true

@@ -1,0 +1,12 @@
+mqtt_broker: "127.0.0.1"
+mqtt_port: 1883
+mqtt_topic_telemetry: "boxes/+/telemetry"
+mqtt_topic_scan: "boxes/+/scan"
+server_rest: "http://10.250.23.72:8000" # Use IP address of central server. If Server is hosted on cloud then server URL
+truck_id: "truck-001"
+local_db: "truck_local.db"
+
+gps:
+  source: "fixed"
+  fixed_lat: 12.9716
+  fixed_lon: 77.5946
