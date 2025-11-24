@@ -1,0 +1,9 @@
+PUB=$(awk 'BEGIN { ORS="\\n" } { print }' truck_client_pub.pem)
+
+curl -X POST http://SERVER_IP:8000/register_truck \
+  -H "Content-Type: application/json" \
+  -d "{
+        \"truck_id\": \"TRUCK-001\",
+        \"pub_key_pem\": \"$PUB\",
+        \"assigned_truck\": null
+      }"

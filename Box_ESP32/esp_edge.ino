@@ -1,323 +1,396 @@
-/* esp32_box_main.ino (PATCHED for POC)
-   - DS18B20 on ONE_WIRE_BUS
-   - Publishes telemetry to: boxes/<box_id>/telemetry   (JSON)
-   - Publishes scans to:     boxes/<box_id>/scan        (JSON: full passkey JSON if available; else token)
-   - ESP32 does NOT add GPS (Truck appends GPS)
-   - Telemetry interval ≈ 2 minutes (configurable)
-   - Optional signing (disabled by default for POC stability)
-
-   Libraries:
-     - DallasTemperature, OneWire
-     - PubSubClient
-     - ArduinoJson
-     - MFRC522
-*/
+/*
+ * esp_edge.ino (POC, 3 channels + RFID + DS18B20, NO lookup / NO order on box)
+ *
+ * ESP32 edge node:
+ *  - Connects to WiFi
+ *  - Uses MQTT over TLS (port 8883) to truck Pi (Mosquitto)
+ *  - Loads CA, client cert, and key from LittleFS:
+ *       /certs/ca.crt
+ *       /certs/esp_client.crt
+ *       /certs/esp_client.key
+ *
+ * MQTT topics:
+ *   boxes/<BOX_ID>/telemetry   -- periodic temperature + metadata
+ *   boxes/<BOX_ID>/alerts      -- temp out of range, etc.
+ *   boxes/<BOX_ID>/scan        -- passkey scans from RFID / Serial
+ *
+ * IMPORTANT DESIGN POINT:
+ *   - Box does NOT know order_id.
+ *   - Box does NOT map RFID → order.
+ *   - Box ONLY sends:
+ *        {
+ *          "box_id": "<BOX_ID>",
+ *          "passkey_string": "<whatever RFID/Serial gave>",
+ *          "ts": <device timestamp>
+ *        }
+ *     to MQTT topic boxes/<BOX_ID>/scan.
+ *
+ * Temperature:
+ *   DS18B20 on a OneWire pin (change PIN_TEMP if needed).
+ *
+ * RFID:
+ *   MFRC522 via SPI to read UID or tag data and treat it as "passkey_string".
+ */
 
 #include <WiFi.h>
-#include <LittleFS.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <DallasTemperature.h>
-#include <OneWire.h>
-#include <time.h>
+#include <LittleFS.h>
+
 #include <SPI.h>
 #include <MFRC522.h>
 
-// ---------- POC config ----------
-#define ENABLE_SIGNING   0     // 0 = disable signing (recommended for POC); 1 = enable mbedTLS signing
-#define TELEM_MS         120000UL  // ~2 minutes
-#define ONE_WIRE_BUS     25
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
-// RC522 pins
-#define RST_PIN          22
-#define SS_PIN           21  // SDA/SS
+// ----------- CONFIG (EDIT THESE) -----------
 
-// WiFi / MQTT (set these)
-const char* ssid        = "Balaji.2007@74";
-const char* password    = "172411@1234";
-const char* mqtt_server = "192.168.29.189";
-const int   mqtt_port   = 1883;
+const char* WIFI_SSID     = "YourWiFiSSID";
+const char* WIFI_PASSWORD = "Password123";
 
-// IMPORTANT: box_id = device_id for topic naming. Change per device or load from FS.
-const char* box_id      = "box-001";
+// For POC, use the Pi's LAN IP directly, e.g. "192.168.1.50"
+const char* MQTT_HOST = "TRUCK_PI_IP_ADDRESS";
+const uint16_t MQTT_PORT = 8883;
 
-// ---------- Globals ----------
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+// Logical IDs used in messages
+const char* BOX_ID   = "BOX-001";
 
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+// Period for telemetry in ms
+const unsigned long TELEMETRY_INTERVAL_MS = 5000;  // 5 seconds
 
-// RFID (RC522)
-MFRC522 rfid(SS_PIN, RST_PIN);
+// Temperature sensor (DS18B20) pin
+#define PIN_TEMP 4
+OneWire oneWire(PIN_TEMP);
+DallasTemperature tempSensors(&oneWire);
 
-// ---------- Optional signing (off by default) ----------
-#if ENABLE_SIGNING
-  #include <mbedtls/pk.h>
-  #include <mbedtls/sha256.h>
-  #include <mbedtls/ctr_drbg.h>
-  #include <mbedtls/entropy.h>
-  mbedtls_pk_context device_pk;
-  mbedtls_ctr_drbg_context ctr_drbg;
-  mbedtls_entropy_context entropy;
+// Temperature alert thresholds (adjust for your cold chain)
+const float TEMP_LOW_LIMIT  = 2.0f;
+const float TEMP_HIGH_LIMIT = 8.0f;
 
-  String readFileToString(const char* path) {
-    if (!LittleFS.exists(path)) return "";
-    File f = LittleFS.open(path, "r");
-    String s;
-    while (f.available()) s += (char)f.read();
-    f.close();
-    return s;
+// RFID (MFRC522) pin mapping for ESP32 (ADJUST TO YOUR WIRING)
+#define RFID_SS_PIN  5    // SDA / SS
+#define RFID_RST_PIN 27   // RST
+MFRC522 mfrc522(RFID_SS_PIN, RFID_RST_PIN);
+
+// -------------------------------------------
+
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+
+unsigned long lastTelemetryMs = 0;
+
+// Track last seen UID so we don't fire repeatedly while card is held
+String lastRfidValue = "";
+unsigned long lastRfidTimeMs = 0;
+const unsigned long RFID_RETRIGGER_MS = 2000;  // minimum gap between same tag scans
+
+// ---------- LittleFS helpers ----------
+
+String readFileToString(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    Serial.print("Failed to open file: ");
+    Serial.println(path);
+    return String();
+  }
+  String content;
+  while (f.available()) {
+    content += char(f.read());
+  }
+  f.close();
+  return content;
+}
+
+// ---------- WiFi / TLS / MQTT ----------
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+bool configureTLSFromFS() {
+  Serial.println("Mounting LittleFS...");
+  if (!LittleFS.begin(true)) {  // true => format if mount fails (POC)
+    Serial.println("LittleFS mount failed");
+    return false;
+  }
+  Serial.println("LittleFS mounted");
+
+  String ca   = readFileToString("/ca.crt");
+  String cert = readFileToString("/esp_client.crt");
+  String key  = readFileToString("/esp_client.key");
+
+  Serial.printf("CA len: %d, cert len: %d, key len: %d\n",
+                ca.length(), cert.length(), key.length());
+
+  if (ca.length() == 0 || cert.length() == 0 || key.length() == 0) {
+    Serial.println("Missing cert/key files in /certs");
+    return false;
   }
 
-  bool init_signing() {
-    mbedtls_pk_init(&device_pk);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-    mbedtls_entropy_init(&entropy);
-    const char *pers = "esp32_sign";
-    if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                              (const unsigned char*)pers, strlen(pers)) != 0) {
-      Serial.println("ctr_drbg_seed failed");
-      return false;
-    }
-    String pem = readFileToString("/esp_priv.pem");
-    if (pem.length() == 0) {
-      Serial.println("Missing /esp_priv.pem");
-      return false;
-    }
-    int rc = mbedtls_pk_parse_key(&device_pk,
-                                  (const unsigned char*)pem.c_str(),
-                                  pem.length() + 1,
-                                  NULL, 0,
-                                  mbedtls_ctr_drbg_random, &ctr_drbg);
-    if (rc != 0) {
-      Serial.printf("pk_parse_key failed: %d\n", rc);
-      return false;
-    }
-    return true;
-  }
+  secureClient.setCACert(ca.c_str());
+  secureClient.setCertificate(cert.c_str());
+  secureClient.setPrivateKey(key.c_str());
+  secureClient.setTimeout(5000);
 
-  // Simple base64 (RFC 4648)
-  String base64_encode(const unsigned char* data, size_t len) {
-    const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    String out;
-    size_t i = 0;
-    while (i + 3 <= len) {
-      uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i+1] << 8) | ((uint32_t)data[i+2]);
-      out += b64[(v >> 18) & 0x3F];
-      out += b64[(v >> 12) & 0x3F];
-      out += b64[(v >> 6) & 0x3F];
-      out += b64[v & 0x3F];
-      i += 3;
-    }
-    if (i < len) {
-      int rem = len - i;
-      uint32_t v = ((uint32_t)data[i] << 16) | (rem > 1 ? ((uint32_t)data[i+1] << 8) : 0);
-      out += b64[(v >> 18) & 0x3F];
-      out += b64[(v >> 12) & 0x3F];
-      if (rem == 2) out += b64[(v >> 6) & 0x3F]; else out += '=';
-      out += '=';
-    }
-    return out;
-  }
+  // POC ONLY: disable hostname verification, because we're using IP but
+  // the broker cert CN is something like broker.example.local.
+  // Remove this and use proper DNS in a production setup.
+  secureClient.setInsecure();
 
-  String sign_payload_and_wrap(const String& payload_json) {
-    // Hash
-    unsigned char hash[32];
-    mbedtls_sha256_context sha;
-    mbedtls_sha256_init(&sha);
-    mbedtls_sha256_starts(&sha, 0);
-    mbedtls_sha256_update(&sha, (const unsigned char*)payload_json.c_str(), payload_json.length());
-    mbedtls_sha256_finish(&sha, hash);
-    mbedtls_sha256_free(&sha);
+  Serial.println("TLS configured from LittleFS");
+  return true;
+}
 
-    // Sign (mbedTLS v3 API: needs sig buffer size and hash length)
-    unsigned char sig[128];
-    size_t sig_len = 0;
-    int rc = mbedtls_pk_sign(&device_pk,
-                             MBEDTLS_MD_SHA256,
-                             hash,
-                             sizeof(hash),         // <-- hash length (32)
-                             sig,
-                             sizeof(sig),          // <-- sig buffer size
-                             &sig_len,
-                             mbedtls_ctr_drbg_random,
-                             &ctr_drbg);
-    if (rc != 0) {
-      Serial.printf("mbedtls_pk_sign failed: %d\n", rc);
-      return String();
-    }
-    String sig_b64 = base64_encode(sig, sig_len);
-
-    // Wrap
-    StaticJsonDocument<512> doc;
-    doc["device_id"] = box_id;
-    doc["ts"] = (int)time(nullptr);
-    doc["payload_canonical"] = payload_json;  // for verification elsewhere
-    doc["signature_b64"] = sig_b64;
-    String out;
-    serializeJson(doc, out);
-    return out;
-  }
-#endif
-
-// ---------- Helpers ----------
-bool mqtt_connect() {
+void connectMQTT() {
   while (!mqttClient.connected()) {
-    Serial.print("MQTT...");
-    if (mqttClient.connect(box_id)) {
-      Serial.println("ok");
-      return true;
+    Serial.printf("Connecting to MQTT(TLS) at %s:%d ...\n", MQTT_HOST, MQTT_PORT);
+    String clientId = "esp_edge_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("MQTT connected");
     } else {
-      Serial.print("fail rc=");
+      Serial.print("MQTT connect failed, state=");
       Serial.println(mqttClient.state());
       delay(2000);
     }
   }
-  return true;
 }
 
-String make_telem_payload(float tempC, int ts) {
-  // Minimal JSON the Truck expects; Truck appends order_id/GPS
+// ---------- Temperature sensor ----------
+
+float readTemperatureC() {
+  tempSensors.requestTemperatures();
+  float t = tempSensors.getTempCByIndex(0);
+  if (t == DEVICE_DISCONNECTED_C) {
+    Serial.println("Temperature sensor disconnected!");
+    return NAN;
+  }
+  return t;
+}
+
+// ---------- MQTT publishers ----------
+
+void publishTelemetry(float temperatureC) {
+  char topic[64];
+  snprintf(topic, sizeof(topic), "boxes/%s/telemetry", BOX_ID);
+
   StaticJsonDocument<256> doc;
-  doc["device_id"] = box_id;
-  doc["ts"] = ts;
-  JsonObject p = doc.createNestedObject("payload");
-  p["temperature"] = tempC;
-  String out; serializeJson(doc, out);
-  return out;
-}
+  doc["ts"] = (long)(millis() / 1000);
+  doc["box_id"] = BOX_ID;
+  doc["temperature"] = temperatureC;
 
-// Read tag (MIFARE Classic) into a string; returns true if any bytes read
-bool read_tag_string(String& out) {
-  out = "";
-  MFRC522::MIFARE_Key key;
-  for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
-
-  // Read a reasonable range of data blocks (skip trailer blocks)
-  // Blocks 4..62 (sectors 1..15), skipping trailer every 4th block
-  for (byte block = 4; block <= 62; block++) {
-    if ((block % 4) == 3) continue; // trailer block
-    if (rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &rfid.uid) != MFRC522::STATUS_OK) {
-      // stop reading further if auth fails mid-way
-      break;
-    }
-    byte buf[18]; byte size = sizeof(buf);
-    if (rfid.MIFARE_Read(block, buf, &size) != MFRC522::STATUS_OK) break;
-    for (int i = 0; i < 16; i++) {
-      char c = (char)buf[i];
-      if (c == '\0') { return true; }
-      out += c;
-    }
-  }
-  return out.length() > 0;
-}
-
-void publish_scan_payload(const String& jsonOrToken) {
-  String topic = String("boxes/") + box_id + "/scan";
-  // Try to detect if jsonOrToken is JSON; if not, wrap as token
-  StaticJsonDocument<512> tmp;
-  DeserializationError err = deserializeJson(tmp, jsonOrToken);
-  String out;
-  if (!err && tmp.is<JsonObject>()) {
-    // Already full JSON from tag (ideal case)
-    serializeJson(tmp, out);
+  char payload[256];
+  size_t n = serializeJson(doc, payload, sizeof(payload));
+  if (!mqttClient.publish(topic, payload, n)) {
+    Serial.println("Failed to publish telemetry");
   } else {
-    // Token-only fallback
-    StaticJsonDocument<256> doc;
-    doc["passkey_string"] = jsonOrToken;
-    serializeJson(doc, out);
+    Serial.print("Telemetry published: ");
+    Serial.println(payload);
   }
-  mqttClient.publish(topic.c_str(), out.c_str(), true);
-  Serial.printf("Published scan (%u bytes) to %s\n", out.length(), topic.c_str());
 }
 
-// ---------- Setup / Loop ----------
-unsigned long lastTelem = 0;
+void publishAlert(const char* reason, float temperatureC) {
+  char topic[64];
+  snprintf(topic, sizeof(topic), "boxes/%s/alerts", BOX_ID);
+
+  StaticJsonDocument<256> doc;
+  doc["ts"] = (long)(millis() / 1000);
+  doc["box_id"] = BOX_ID;
+  doc["reason"] = reason;
+  doc["temperature"] = temperatureC;
+
+  char payload[256];
+  size_t n = serializeJson(doc, payload, sizeof(payload));
+  if (!mqttClient.publish(topic, payload, n)) {
+    Serial.println("Failed to publish alert");
+  } else {
+    Serial.print("Alert published: ");
+    Serial.println(payload);
+  }
+}
+
+void publishScan(const String& passkey) {
+  char topic[64];
+  snprintf(topic, sizeof(topic), "boxes/%s/scan", BOX_ID);
+
+  StaticJsonDocument<512> doc;
+  doc["ts"] = (long)(millis() / 1000);
+  doc["box_id"] = BOX_ID;
+  doc["passkey_string"] = passkey;  // ONLY passkey string + box_id
+
+  char payload[512];
+  size_t n = serializeJson(doc, payload, sizeof(payload));
+  if (!mqttClient.publish(topic, payload, n)) {
+    Serial.println("Failed to publish scan");
+  } else {
+    Serial.print("Scan published: ");
+    Serial.println(payload);
+  }
+}
+
+// ---------- Serial scan (manual) ----------
+
+/*
+ * Parse Serial input to simulate a scan.
+ * Expected format:
+ *   SCAN <PASSKEY_STRING>
+ * (For backward compatibility, we also accept "SCAN <ORDER_ID> <PASSKEY_STRING>"
+ *  but ignore the ORDER_ID and only send passkey_string.)
+ */
+void handleSerialScan() {
+  if (!Serial.available()) return;
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+
+  if (!line.startsWith("SCAN ")) {
+    Serial.println("Use: SCAN <PASSKEY_STRING>  or  SCAN <ORDER_ID> <PASSKEY_STRING>");
+    return;
+  }
+
+  // Split into tokens
+  int firstSpace = line.indexOf(' ');
+  if (firstSpace < 0) {
+    Serial.println("Invalid SCAN format");
+    return;
+  }
+
+  String rest = line.substring(firstSpace + 1);
+  rest.trim();
+
+  // If there is another space, assume "ORDER_ID PASSKEY"
+  int secondSpace = rest.indexOf(' ');
+  String passkey;
+  if (secondSpace < 0) {
+    // SCAN <PASSKEY>
+    passkey = rest;
+  } else {
+    // SCAN <ORDER_ID> <PASSKEY>
+    passkey = rest.substring(secondSpace + 1);
+  }
+  passkey.trim();
+
+  if (passkey.length() == 0) {
+    Serial.println("Invalid SCAN arguments (empty passkey).");
+    return;
+  }
+
+  publishScan(passkey);
+}
+
+// ---------- RFID handling ----------
+
+// Convert UID to hex string and use it directly as passkey_string.
+// If your old code reads block data instead, you can replace this
+// with your previous "read passkey from tag" logic.
+String uidToHexString(MFRC522::Uid* uid) {
+  String s;
+  for (byte i = 0; i < uid->size; i++) {
+    if (uid->uidByte[i] < 0x10) s += "0";
+    s += String(uid->uidByte[i], HEX);
+  }
+  s.toUpperCase();
+  return s;
+}
+
+// If you have more advanced logic (e.g., reading MIFARE blocks),
+// replace this function to return the correct passkey string.
+String readPasskeyFromTag() {
+  // For now, we treat UID hex as passkey_string.
+  return uidToHexString(&mfrc522.uid);
+}
+
+void handleRfidScan() {
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  String passkey = readPasskeyFromTag();
+  unsigned long nowMs = millis();
+
+  // Avoid retriggering rapidly for the same tag
+  if (passkey == lastRfidValue && (nowMs - lastRfidTimeMs) < RFID_RETRIGGER_MS) {
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    return;
+  }
+
+  lastRfidValue = passkey;
+  lastRfidTimeMs = nowMs;
+
+  Serial.print("RFID tag detected, passkey_string = ");
+  Serial.println(passkey);
+
+  // NO lookup, NO order_id here. Just send passkey_string + box_id.
+  publishScan(passkey);
+
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+// ---------- Setup / loop ----------
 
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(1000);
+  Serial.println();
+  Serial.println("ESP32 Edge starting (MQTT over TLS, keys in LittleFS, RFID + DS18B20, NO lookup)...");
 
-  // Filesystem
-  if (!LittleFS.begin()) {
-    Serial.println("LittleFS mount failed (ok for POC if not signing)");
-  } else {
-    Serial.println("LittleFS mounted");
+  if (!configureTLSFromFS()) {
+    Serial.println("TLS configuration failed; check /certs files");
   }
 
-#if ENABLE_SIGNING
-  if (!init_signing()) {
-    Serial.println("Signing init failed (continuing without signing)");
-  } else {
-    Serial.println("Signing ready");
-  }
-#endif
+  connectWiFi();
 
-  // Sensors
-  sensors.begin();
+  // Temperature sensor init
+  tempSensors.begin();
+  Serial.println("DS18B20 temperature sensor initialized");
 
-  // WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("WiFi");
-  while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(300); }
-  Serial.println(" connected");
+  // RFID init
+  SPI.begin();
+  mfrc522.PCD_Init();
+  Serial.println("MFRC522 RFID reader initialized");
 
-  // MQTT
-  mqttClient.setServer(mqtt_server, mqtt_port);
-  mqtt_connect();
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  connectMQTT();
 
-  // Time (for ts)
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
-
-  // RFID
-  SPI.begin();       // default HSPI pins: SCK=18, MISO=19, MOSI=23
-  rfid.PCD_Init();
-  Serial.println("RFID ready");
+  lastTelemetryMs = millis();
 }
 
 void loop() {
-  if (!mqttClient.connected()) mqtt_connect();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, reconnecting...");
+    connectWiFi();
+  }
+
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+
   mqttClient.loop();
 
-  // Telemetry every TELEM_MS
-  if (millis() - lastTelem >= TELEM_MS) {
-    sensors.requestTemperatures();
-    float temp = sensors.getTempCByIndex(0);
-    int ts = (int)time(nullptr);
-
-    // Build payload (no GPS). If signing enabled, wrap signed; else raw JSON.
-    String payload = make_telem_payload(temp, ts);
-#if ENABLE_SIGNING
-    String signed_wrap = sign_payload_and_wrap(payload);
-    if (signed_wrap.length() > 0) {
-      String topic = String("boxes/") + box_id + "/telemetry";
-      mqttClient.publish(topic.c_str(), signed_wrap.c_str(), true);
-      Serial.printf("Telemetry (signed) %.2fC @ %d\n", temp, ts);
-    } else {
-      Serial.println("Telemetry signing failed; skipping publish");
+  unsigned long now = millis();
+  if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryMs = now;
+    float tC = readTemperatureC();
+    publishTelemetry(tC);
+    if (!isnan(tC) && (tC < TEMP_LOW_LIMIT || tC > TEMP_HIGH_LIMIT)) {
+      publishAlert("temperature_out_of_range", tC);
     }
-#else
-    String topic = String("boxes/") + box_id + "/telemetry";
-    mqttClient.publish(topic.c_str(), payload.c_str(), true);
-    Serial.printf("Telemetry %.2fC @ %d\n", temp, ts);
-#endif
-    lastTelem = millis();
   }
 
-  // RFID: detect & read; publish full JSON if present
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    String tagContent;
-    bool ok = read_tag_string(tagContent);
-    if (ok && tagContent.length() > 0) {
-      Serial.println("Tag read:");
-      Serial.println(tagContent);
-      publish_scan_payload(tagContent);
-    } else {
-      Serial.println("Tag read: empty or failed");
-    }
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
-    delay(400); // debounce
-  }
+  handleSerialScan();
+  handleRfidScan();
 }

@@ -1,3 +1,4 @@
+# models.py
 # --- PATCHED: models.py ---
 # No breaking changes. Kept schema stable.
 # Notes:
