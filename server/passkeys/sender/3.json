@@ -1,0 +1,7 @@
+{
+  "order_id": "3",
+  "role": "sender",
+  "passkey_string": "eyJjcmVhdGVkX3RpbWVzdGFtcCI6IjIwMjUtMTEtMjRUMjM6MTM6NTAuNDQ5NDcyWiIsImV4cGlyZXNfYXQiOiIyMDI1LTExLTI1VDAwOjQzOjUwLjQ0OTQ3MloiLCJvcmRlcl9pZCI6IjMiLCJyb2xlIjoic2VuZGVyIn0.MEUCIFX3-vyuqeBmT2zl7FE7qXwArbhnF87Fpo-TnEwciEu1AiEApNzsntOgGXXxlt3gwBu7hI40--Ak7dYbFhzkwWjRO8I",
+  "created_timestamp": "2025-11-24T23:13:50.449472Z",
+  "expires_at": "2025-11-25T00:43:50.449472Z"
+}

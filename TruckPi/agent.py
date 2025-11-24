@@ -1,28 +1,34 @@
-# --- FINAL: truck_agent.py ---
-# Highlights:
-# - Safe URL builder, fail-fast config check
-# - Thread-safe SQLite (per-call cursor + lock, WAL mode)
-# - Durable outbox with exponential backoff, drops permanent 4xx
-# - Telemetry duplicates key fields to top-level for audit visibility
-# - order_id omitted (not null) when unknown
-# - Better debug logging; idempotent message_id for telemetry
+# --- COMPLETE: truck_agent.py with MQTT TLS + Truck Attestation ---
 
 import paho.mqtt.client as mqtt
-import json, sqlite3, yaml, time, requests, os, threading, csv, sys, uuid
+import json, sqlite3, yaml, time, requests, os, threading, csv, sys, uuid, base64, ssl
 from datetime import datetime, timezone
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.backends import default_backend
 
 # ========= Config =========
 cfg = yaml.safe_load(open("config.yaml"))
 
-MQTT_BROKER = cfg.get("mqtt_broker", "127.0.0.1")
-MQTT_PORT   = int(cfg.get("mqtt_port", 1883))
-SERVER_REST = str(cfg.get("server_rest", "http://10.250.23.7:8000")).strip()
-TRUCK_ID    = cfg.get("truck_id", "truck-001")
+MQTT_BROKER = cfg.get("mqtt_broker", "broker.example.local")
+MQTT_PORT   = int(cfg.get("mqtt_port", 8883))
+MQTT_USE_TLS = MQTT_PORT == 8883  # Auto-detect TLS from port
+
+# TLS certificates for MQTT
+MQTT_CA_CERT = cfg.get("mqtt_ca_cert", "keys/ca/ca.crt")
+MQTT_CLIENT_CERT = cfg.get("mqtt_client_cert", "keys/truck/truck_client.crt")
+MQTT_CLIENT_KEY = cfg.get("mqtt_client_key", "keys/truck/truck_client.key")
+
+SERVER_REST = str(cfg.get("server_rest", "http://192.168.29.249:8000")).strip()
+TRUCK_ID    = cfg.get("truck_id", "TRUCK-001")
 LOCAL_DB    = cfg.get("local_db", "truck_local.db")
+
+# Truck attestation key (can reuse MQTT client key)
+TRUCK_PRIVKEY_PATH = cfg.get("truck_privkey_pem", "keys/truck/truck_client.key")
 
 # GPS configuration
 gps_cfg = cfg.get("gps", {}) or {}
-GPS_SOURCE = gps_cfg.get("source", "gpsd")  # "gpsd" | "serial" | "fixed" | "none"
+GPS_SOURCE = gps_cfg.get("source", "gpsd")
 GPSD_HOST  = gps_cfg.get("gpsd_host", "127.0.0.1")
 GPSD_PORT  = int(gps_cfg.get("gpsd_port", 2947))
 SERIAL_DEV = gps_cfg.get("serial_device", "/dev/ttyUSB0")
@@ -38,21 +44,63 @@ SCANS_CSV = os.path.join(LOG_DIR, "scans.csv")
 # ========= Early config validation =========
 if any(s in SERVER_REST.lower() for s in ["<server_ip_or_host>", "<", ">"]):
     print(f"FATAL: SERVER_REST in config.yaml is still a placeholder: {SERVER_REST}")
-    print("Please set server_rest to something like 'http://192.168.29.249:8000'")
     sys.exit(2)
+
+# ========= Load Truck Private Key for Attestation =========
+
+def load_truck_private_key(path: str):
+    """Load truck's ECDSA private key for signing attestations"""
+    try:
+        with open(path, "rb") as f:
+            pem_data = f.read()
+            return serialization.load_pem_private_key(
+                pem_data,
+                password=None,
+                backend=default_backend()
+            )
+    except Exception as e:
+        print(f"ERROR: Failed to load truck private key from {path}: {e}")
+        print("Truck attestation will fail without this key!")
+        return None
+
+TRUCK_PRIVKEY = load_truck_private_key(TRUCK_PRIVKEY_PATH)
+
+if TRUCK_PRIVKEY is None:
+    print(f"WARNING: Truck private key not loaded from {TRUCK_PRIVKEY_PATH}")
+    print("Attestation signatures will fail!")
+else:
+    print(f"✓ Truck private key loaded from {TRUCK_PRIVKEY_PATH}")
+
+# ========= Attestation Signing =========
+
+def sign_truck_attestation(payload: dict) -> str:
+    """
+    Sign a payload with truck's private key.
+    Returns base64url-encoded signature.
+    
+    The payload must NOT contain 'truck_sig' field.
+    """
+    if TRUCK_PRIVKEY is None:
+        raise RuntimeError("Truck private key not loaded - cannot sign attestation")
+    
+    # Check if it's an EC key
+    if not isinstance(TRUCK_PRIVKEY, ec.EllipticCurvePrivateKey):
+        raise RuntimeError(f"Truck key is not EC key, got {type(TRUCK_PRIVKEY)}")
+    
+    # Canonical JSON (sorted keys, no spaces)
+    data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    
+    # Sign with ECDSA
+    signature = TRUCK_PRIVKEY.sign(data, ec.ECDSA(hashes.SHA256()))
+    
+    # Return base64url-encoded (no padding)
+    return base64.urlsafe_b64encode(signature).decode('utf-8').rstrip('=')
 
 # ========= HTTP =========
 PERMANENT_4XX = {400, 401, 403, 404, 405, 409, 410, 415, 422}
-HTTP_TIMEOUT = (3.5, 8.0)  # (connect, read) seconds
+HTTP_TIMEOUT = (3.5, 8.0)
 
 session = requests.Session()
-# You can uncomment basic retries for transient 5xx/429 if you like:
-# from requests.adapters import HTTPAdapter
-# from urllib3.util.retry import Retry
-# retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429,502,503,504], allowed_methods=frozenset(["POST"]))
-# adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-# session.mount("http://", adapter)
-# session.mount("https://", adapter)
 
 def build_url(base: str, endpoint: str) -> str:
     return f"{base.rstrip('/')}/{endpoint.lstrip('/')}"
@@ -65,8 +113,8 @@ with db_lock:
     c.execute("""CREATE TABLE IF NOT EXISTS boxes (box_id TEXT PRIMARY KEY, current_order TEXT DEFAULT '000')""")
     c.execute("""CREATE TABLE IF NOT EXISTS outbox_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL,              -- 'telemetry' | 'scan'
-        endpoint TEXT NOT NULL,          -- 'telemetry_upload' | 'validate_scan'
+        type TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
         body_json TEXT NOT NULL,
         next_attempt_at INTEGER NOT NULL,
         retry_count INTEGER NOT NULL DEFAULT 0,
@@ -129,12 +177,17 @@ class GPSProvider:
     def _run(self):
         if GPS_SOURCE == "fixed":
             self._update(FIXED_LAT, FIXED_LON)
-            while not self._stop.is_set(): time.sleep(1); return
+            print(f"GPS: Using fixed location ({FIXED_LAT}, {FIXED_LON})")
+            while not self._stop.is_set(): time.sleep(1)
+            return
 
         if GPS_SOURCE == "none":
-            while not self._stop.is_set(): time.sleep(2); return
+            print("GPS: Disabled")
+            while not self._stop.is_set(): time.sleep(2)
+            return
 
         if GPS_SOURCE == "gpsd":
+            print(f"GPS: Connecting to gpsd at {GPSD_HOST}:{GPSD_PORT}")
             try:
                 import socket
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -156,10 +209,13 @@ class GPSProvider:
                                     self._update(lat, lon)
                     except socket.timeout: continue
                     except Exception: time.sleep(1); continue
-            except Exception:
-                while not self._stop.is_set(): time.sleep(2); return
+            except Exception as e:
+                print(f"GPS: gpsd connection failed: {e}")
+                while not self._stop.is_set(): time.sleep(2)
+                return
 
         if GPS_SOURCE == "serial":
+            print(f"GPS: Reading from serial {SERIAL_DEV}")
             try:
                 import serial
                 ser = serial.Serial(SERIAL_DEV, 9600, timeout=1)
@@ -183,15 +239,17 @@ class GPSProvider:
                                 if lat is not None and lon is not None:
                                     self._update(lat, lon)
                     except Exception: time.sleep(0.5); continue
-            except Exception:
-                while not self._stop.is_set(): time.sleep(2); return
+            except Exception as e:
+                print(f"GPS: Serial connection failed: {e}")
+                while not self._stop.is_set(): time.sleep(2)
+                return
 
 gps = GPSProvider(); gps.start()
 
 # ========= Outbox =========
-BACKOFF_BASE = 2        # seconds
-BACKOFF_MAX  = 60       # cap
-CATCHUP_RATE_HZ = 5     # max sends/sec when draining
+BACKOFF_BASE = 2
+BACKOFF_MAX  = 60
+CATCHUP_RATE_HZ = 5
 
 def enqueue(type_: str, endpoint: str, body: dict, initial_delay: int = 0, last_error: str = None):
     db_exec(
@@ -205,7 +263,6 @@ def try_send_row(row):
     body = json.loads(body_json)
     url = build_url(SERVER_REST, endpoint)
     try:
-        print(f"[debug] retry POST {url}")
         r = session.post(url, json=body, timeout=HTTP_TIMEOUT)
         if r.status_code == 200:
             db_exec("DELETE FROM outbox_queue WHERE id=?", (_id,), commit=True)
@@ -250,7 +307,6 @@ def forward_json(endpoint: str, body: dict, type_: str):
     endpoint = endpoint.lstrip('/')
     url = build_url(SERVER_REST, endpoint)
     try:
-        print(f"[debug] POST {url}")
         r = session.post(url, json=body, timeout=HTTP_TIMEOUT)
         if r.status_code == 200:
             return True, r
@@ -268,127 +324,192 @@ def forward_json(endpoint: str, body: dict, type_: str):
 def handle_telemetry(box_id, payload_from_device):
     cur_order = get_current_order(box_id)
 
-    # Read & normalize device payload
     inner = dict(payload_from_device or {})
     if "Temperature" in inner and "temperature" not in inner:
         inner["temperature"] = inner["Temperature"]
 
-    # GPS & device ts
     lat, lon = gps.get()
     device_ts = int(inner.get("ts", int(time.time())))
     temperature = inner.get("temperature")
 
-    # If not attached, just log locally and return (policy)
     if not cur_order or cur_order == '000':
-        print(f"[telemetry] box {box_id} not attached to any order — logging locally only")
+        print(f"[telemetry] box {box_id} not attached – logging locally only")
         csv_append(TELEM_CSV,
                    ["recv_ts_iso","box_id","device_ts","temperature","truck_lat","truck_lon","order_id","forwarded"],
                    [now_iso(), box_id, device_ts, temperature, lat, lon, None, False])
         return
 
-    # Populate nested payload with order_id + GPS (back-compat)
     inner["order_id"] = inner.get("order_id", cur_order)
     inner["lat"] = lat
     inner["lon"] = lon
 
-    # Build body with top-level duplicates for audit
+    # Build telemetry body WITHOUT truck_sig first
+    # IMPORTANT: Only include fields that server expects in TelemetryModel
     body = {
-        "message_id": f"{box_id}-{device_ts}",   # helps server dedupe
         "device_id": box_id,
         "ts": device_ts,
-
-        # Top-level duplicates for audit log
-        "order_id": cur_order,
-        "temperature": temperature,
-        "truck_lat": lat,
-        "truck_lon": lon,
-
-        # Optional conventional GPS object
-        "gps": {"lat": lat, "lon": lon},
-
-        # Original nested payload
-        "payload": inner
+        "payload": inner,
+        "truck_id": TRUCK_ID
     }
 
+    # Sign the telemetry (canonical JSON without truck_sig)
+    try:
+        truck_sig = sign_truck_attestation(body)
+        body["truck_sig"] = truck_sig
+    except Exception as e:
+        print(f"[ERROR] Failed to sign telemetry: {e}")
+        body["truck_sig"] = ""
+
     ok, resp = forward_json("telemetry_upload", body, type_="telemetry")
-    print("[telemetry] forwarded:", ok, "for box", box_id, f"(http={getattr(resp,'status_code', 'net')})")
+    
+    # Enhanced logging with response details
+    if ok:
+        print(f"[telemetry] ✓ forwarded for box {box_id}")
+    else:
+        status_code = getattr(resp, 'status_code', 'network_error')
+        error_text = getattr(resp, 'text', 'no response')[:100] if resp else 'connection failed'
+        print(f"[telemetry] ✗ failed for box {box_id}: {status_code} - {error_text}")
 
     csv_append(TELEM_CSV,
                ["recv_ts_iso","box_id","device_ts","temperature","truck_lat","truck_lon","order_id","forwarded"],
                [now_iso(), box_id, device_ts, temperature, lat, lon, cur_order, bool(ok)])
 
+
+# ========= Alerts =========
+def handle_alert(box_id, payload_from_device):
+    """
+    Handle alert messages from ESP32 boxes.
+    For now, just log locally - no forwarding to server.
+    """
+    alert_type = "unknown"
+    reason = "unknown"
+    temperature = None
+    
+    if isinstance(payload_from_device, dict):
+        alert_type = payload_from_device.get("type", "unknown")
+        reason = payload_from_device.get("reason", "unknown")
+        temperature = payload_from_device.get("temperature")
+    
+    cur_order = get_current_order(box_id)
+    
+    print(f"[alert] ⚠️  box {box_id}: {reason} (temp={temperature}, order={cur_order})")
+    
+    # Log to CSV for audit
+    ALERTS_CSV = os.path.join(LOG_DIR, "alerts.csv")
+    csv_append(ALERTS_CSV,
+               ["recv_ts_iso", "box_id", "order_id", "alert_type", "reason", "temperature"],
+               [now_iso(), box_id, cur_order if cur_order != '000' else None, alert_type, reason, temperature])
+
 # ========= Scans =========
+
 def _scan_payload(box_id, token, order_id: str | None):
-    p = {
+    """
+    Build the payload to send to server's /validate_scan endpoint.
+    Includes truck attestation (truck_id + truck_sig).
+    """
+    # Build payload WITHOUT truck_sig first
+    payload = {
         "passkey_string": token,
-        "device_chain": {"box_id": box_id, "truck_id": TRUCK_ID}
+        "device_chain": {"box_id": box_id, "truck_id": TRUCK_ID},
+        "truck_id": TRUCK_ID
     }
+    
+    # Add order_id if available
     if isinstance(order_id, str) and order_id.strip():
-        p["order_id"] = order_id.strip()
-    return p
+        payload["order_id"] = order_id.strip()
+    
+    # Sign the payload (without truck_sig field)
+    try:
+        truck_sig = sign_truck_attestation(payload)
+        payload["truck_sig"] = truck_sig
+    except Exception as e:
+        print(f"[ERROR] Failed to sign truck attestation: {e}")
+        payload["truck_sig"] = ""
+    
+    return payload
+
 
 def handle_scan_from_passkey_json(box_id, passkey_obj: dict):
-    token = passkey_obj.get("passkey_string") or passkey_obj.get("token") or passkey_obj.get("passkey")
+    """
+    Handle when ESP32 sends a FULL passkey JSON object.
+    """
+    token = passkey_obj.get("passkey_string")
     role = passkey_obj.get("role")
     order_id = passkey_obj.get("order_id")
+    
     if not token:
-        print("[scan] missing passkey_string in JSON"); return
+        print("[scan] ERROR: missing passkey_string in JSON")
+        return
 
     if not order_id:
         cur_order = get_current_order(box_id)
-        if cur_order != '000': order_id = cur_order
+        if cur_order != '000':
+            order_id = cur_order
 
     payload = _scan_payload(box_id, token, order_id)
+    
     ok, resp = forward_json("validate_scan", payload, type_="scan")
     status = "OK" if ok else f"FAIL:{(resp.status_code if resp else 'net')}"
-    print("[scan] validation sent (JSON) ->", status)
+    print(f"[scan] validation sent (full JSON, role={role}) -> {status}")
 
     if ok and resp is not None and resp.status_code == 200:
         data = resp.json()
         if data.get("transition") == "IN_TRANSIT":
             set_current_order(box_id, data["order_id"])
-            print(f"box {box_id} now attached to order {data['order_id']}")
+            print(f"✓ SENDER validated: box {box_id} → order {data['order_id']}")
         elif data.get("transition") == "DELIVERED":
             set_current_order(box_id, '000')
-            print(f"box {box_id} order completed and detached")
+            print(f"✓ RECEIVER validated: order {order_id} completed, box {box_id} detached")
 
     csv_append(SCANS_CSV,
                ["recv_ts_iso","box_id","role","order_id","forwarded","status","remarks"],
                [now_iso(), box_id, role, order_id, bool(ok), status, "full_json"])
 
+
 def handle_scan_token_only(box_id, token: str):
+    """
+    Handle when ESP32 sends ONLY a passkey_string.
+    """
     cur_order = get_current_order(box_id)
     order_id = None if cur_order == '000' else cur_order
     payload = _scan_payload(box_id, token, order_id)
 
     ok, resp = forward_json("validate_scan", payload, type_="scan")
     status = "OK" if ok else f"FAIL:{(resp.status_code if resp else 'net')}"
-    print("[scan] validation sent (token) ->", status)
+    print(f"[scan] validation sent (token only) -> {status}")
 
     if ok and resp is not None and resp.status_code == 200:
         data = resp.json()
         if data.get("transition") == "IN_TRANSIT":
             set_current_order(box_id, data["order_id"])
-            print(f"box {box_id} now attached to order {data['order_id']}")
+            print(f"✓ Box {box_id} → order {data['order_id']}")
         elif data.get("transition") == "DELIVERED":
             set_current_order(box_id, '000')
-            print(f"box {box_id} order completed and detached")
+            print(f"✓ Order completed, box {box_id} detached")
 
     csv_append(SCANS_CSV,
                ["recv_ts_iso","box_id","role","order_id","forwarded","status","remarks"],
                [now_iso(), box_id, None, order_id, bool(ok), status, "token_only"])
 
-# ========= MQTT =========
+# ========= MQTT with TLS =========
+
 def on_connect(client, userdata, flags, rc):
-    print("connected rc", rc)
-    client.subscribe("boxes/+/telemetry")
-    client.subscribe("boxes/+/scan")
+    if rc == 0:
+        print(f"✓ MQTT connected to {MQTT_BROKER}:{MQTT_PORT}")
+        client.subscribe("boxes/+/telemetry")
+        client.subscribe("boxes/+/scan")
+        client.subscribe("boxes/+/alerts")
+        print("✓ Subscribed to: boxes/+/{telemetry,scan,alerts}")
+    else:
+        print(f"✗ MQTT connection failed with code {rc}")
 
 def on_message(client, userdata, msg):
     topic = msg.topic
     parts = topic.split('/')
     if len(parts) >= 3 and parts[0] == 'boxes':
-        box_id = parts[1]; typ = parts[2]
+        box_id = parts[1]
+        typ = parts[2]
+        
         try:
             payload = json.loads(msg.payload.decode())
         except Exception:
@@ -399,35 +520,108 @@ def on_message(client, userdata, msg):
             handle_telemetry(box_id, inner)
 
         elif typ == 'scan':
-            if isinstance(payload, dict) and ("passkey_string" in payload or "token" in payload or "passkey" in payload):
-                handle_scan_from_passkey_json(box_id, payload)
-            else:
-                token = None
-                if isinstance(payload, str):
-                    token = payload.strip()
-                elif payload is None:
-                    try: token = msg.payload.decode().strip()
-                    except Exception: token = None
+            if isinstance(payload, dict):
+                if "passkey_string" in payload:
+                    print(f"[scan] Received full passkey JSON from box {box_id}")
+                    handle_scan_from_passkey_json(box_id, payload)
                 else:
-                    token = (payload.get("data") if isinstance(payload, dict) else None) or token
-                if not token:
-                    print("[scan] no token found in message for box", box_id); return
-                handle_scan_token_only(box_id, token)
+                    token = payload.get("token") or payload.get("data") or payload.get("passkey")
+                    if token:
+                        print(f"[scan] Received token from dict for box {box_id}")
+                        handle_scan_token_only(box_id, str(token))
+                    else:
+                        print(f"[scan] ERROR: dict payload but no token field")
+            
+            elif isinstance(payload, str):
+                print(f"[scan] Received plain token string from box {box_id}")
+                handle_scan_token_only(box_id, payload.strip())
+            
+            else:
+                try:
+                    token = msg.payload.decode().strip()
+                    if token:
+                        print(f"[scan] Received raw token from box {box_id}")
+                        handle_scan_token_only(box_id, token)
+                    else:
+                        print(f"[scan] ERROR: empty payload from box {box_id}")
+                except Exception as e:
+                    print(f"[scan] ERROR: could not decode payload: {e}")
+
+        elif typ == 'alerts':
+            handle_alert(box_id, payload)
+
+def on_disconnect(client, userdata, rc):
+    if rc != 0:
+        print(f"✗ MQTT disconnected unexpectedly (rc={rc})")
+
+# ========= Main =========
 
 if __name__ == "__main__":
-    client = mqtt.Client("truck_agent")
+    print("="*60)
+    print("Truck Agent Starting")
+    print("="*60)
+    print(f"Truck ID:     {TRUCK_ID}")
+    print(f"MQTT Broker:  {MQTT_BROKER}:{MQTT_PORT} (TLS: {MQTT_USE_TLS})")
+    print(f"Server REST:  {SERVER_REST}")
+    print(f"Local DB:     {LOCAL_DB}")
+    print(f"Logs Dir:     {LOG_DIR}")
+    print(f"GPS Source:   {GPS_SOURCE}")
+    print("="*60)
+
+    # Configure MQTT client
+    client = mqtt.Client("truck_agent_" + TRUCK_ID)
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.on_disconnect = on_disconnect
+
+    # Configure TLS if using port 8883
+    if MQTT_USE_TLS:
+        if not os.path.exists(MQTT_CA_CERT):
+            print(f"ERROR: CA cert not found: {MQTT_CA_CERT}")
+            sys.exit(1)
+        if not os.path.exists(MQTT_CLIENT_CERT):
+            print(f"ERROR: Client cert not found: {MQTT_CLIENT_CERT}")
+            sys.exit(1)
+        if not os.path.exists(MQTT_CLIENT_KEY):
+            print(f"ERROR: Client key not found: {MQTT_CLIENT_KEY}")
+            sys.exit(1)
+        
+        print(f"Configuring MQTT TLS:")
+        print(f"  CA:     {MQTT_CA_CERT}")
+        print(f"  Cert:   {MQTT_CLIENT_CERT}")
+        print(f"  Key:    {MQTT_CLIENT_KEY}")
+        
+        client.tls_set(
+            ca_certs=MQTT_CA_CERT,
+            certfile=MQTT_CLIENT_CERT,
+            keyfile=MQTT_CLIENT_KEY,
+            cert_reqs=ssl.CERT_REQUIRED,
+            tls_version=ssl.PROTOCOL_TLS,
+            ciphers=None
+        )
+        # For self-signed certs or development, you might need:
+        # client.tls_insecure_set(True)
+    
+    print("Connecting to MQTT broker...")
+    try:
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    except Exception as e:
+        print(f"FATAL: Could not connect to MQTT broker: {e}")
+        sys.exit(1)
+    
     client.loop_start()
-    print("truck agent running. local DB:", LOCAL_DB, "logs dir:", LOG_DIR, "gps source:", GPS_SOURCE, "server:", SERVER_REST)
+    print("✓ Truck agent running")
+    print("Press Ctrl+C to stop")
+    print("="*60)
+    
     try:
         while True:
             time.sleep(5)
     except KeyboardInterrupt:
-        pass
+        print("\nShutting down...")
     finally:
         gps.stop()
         client.loop_stop()
         client.disconnect()
-
+        conn.close()
+        print("✓ Shutdown complete")
