@@ -1,7 +1,8 @@
 # writer_app.py (FULL PATCHED v3)
 # RFID Passkey Writer GUI
-# Robust Windows handling: better retries, clearer errors, optional no-DTR and post-open stabilize.
 # Requires: pip install pyserial
+
+#Works on Ubuntu. Has permission issues on Windows.
 
 import time
 import json

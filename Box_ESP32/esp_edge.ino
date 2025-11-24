@@ -1,35 +1,27 @@
 /*
- * esp_edge.ino (POC, 3 channels + RFID + DS18B20, NO lookup / NO order on box)
+ * esp_edge.ino (PATCHED - supports full passkey JSON object)
  *
  * ESP32 edge node:
  *  - Connects to WiFi
  *  - Uses MQTT over TLS (port 8883) to truck Pi (Mosquitto)
- *  - Loads CA, client cert, and key from LittleFS:
- *       /certs/ca.crt
- *       /certs/esp_client.crt
- *       /certs/esp_client.key
+ *  - Loads CA, client cert, and key from LittleFS
  *
  * MQTT topics:
  *   boxes/<BOX_ID>/telemetry   -- periodic temperature + metadata
  *   boxes/<BOX_ID>/alerts      -- temp out of range, etc.
- *   boxes/<BOX_ID>/scan        -- passkey scans from RFID / Serial
+ *   boxes/<BOX_ID>/scan        -- passkey scans (FULL JSON OBJECT)
  *
- * IMPORTANT DESIGN POINT:
- *   - Box does NOT know order_id.
- *   - Box does NOT map RFID → order.
- *   - Box ONLY sends:
+ * DESIGN:
+ *   - Box sends COMPLETE passkey JSON object:
  *        {
+ *          "order_id": "...",
+ *          "role": "sender|receiver",
+ *          "passkey_string": "...",
+ *          "created_timestamp": "...",
+ *          "expires_at": "...",
  *          "box_id": "<BOX_ID>",
- *          "passkey_string": "<whatever RFID/Serial gave>",
  *          "ts": <device timestamp>
  *        }
- *     to MQTT topic boxes/<BOX_ID>/scan.
- *
- * Temperature:
- *   DS18B20 on a OneWire pin (change PIN_TEMP if needed).
- *
- * RFID:
- *   MFRC522 via SPI to read UID or tag data and treat it as "passkey_string".
  */
 
 #include <WiFi.h>
@@ -46,10 +38,10 @@
 
 // ----------- CONFIG (EDIT THESE) -----------
 
-const char* WIFI_SSID     = "YourWiFiSSID";
-const char* WIFI_PASSWORD = "Password123";
+const char* WIFI_SSID     = "SSID_GOES_HERE";
+const char* WIFI_PASSWORD = "PASSWORD_GOES_HERE";
 
-// For POC, use the Pi's LAN IP directly, e.g. "192.168.1.50"
+// For POC, use the Pi's LAN IP directly
 const char* MQTT_HOST = "TRUCK_PI_IP_ADDRESS";
 const uint16_t MQTT_PORT = 8883;
 
@@ -64,11 +56,11 @@ const unsigned long TELEMETRY_INTERVAL_MS = 5000;  // 5 seconds
 OneWire oneWire(PIN_TEMP);
 DallasTemperature tempSensors(&oneWire);
 
-// Temperature alert thresholds (adjust for your cold chain)
+// Temperature alert thresholds
 const float TEMP_LOW_LIMIT  = 2.0f;
 const float TEMP_HIGH_LIMIT = 8.0f;
 
-// RFID (MFRC522) pin mapping for ESP32 (ADJUST TO YOUR WIRING)
+// RFID (MFRC522) pin mapping for ESP32
 #define RFID_SS_PIN  5    // SDA / SS
 #define RFID_RST_PIN 27   // RST
 MFRC522 mfrc522(RFID_SS_PIN, RFID_RST_PIN);
@@ -80,10 +72,10 @@ PubSubClient mqttClient(secureClient);
 
 unsigned long lastTelemetryMs = 0;
 
-// Track last seen UID so we don't fire repeatedly while card is held
+// Track last seen UID
 String lastRfidValue = "";
 unsigned long lastRfidTimeMs = 0;
-const unsigned long RFID_RETRIGGER_MS = 2000;  // minimum gap between same tag scans
+const unsigned long RFID_RETRIGGER_MS = 2000;
 
 // ---------- LittleFS helpers ----------
 
@@ -121,7 +113,7 @@ void connectWiFi() {
 
 bool configureTLSFromFS() {
   Serial.println("Mounting LittleFS...");
-  if (!LittleFS.begin(true)) {  // true => format if mount fails (POC)
+  if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
     return false;
   }
@@ -135,7 +127,7 @@ bool configureTLSFromFS() {
                 ca.length(), cert.length(), key.length());
 
   if (ca.length() == 0 || cert.length() == 0 || key.length() == 0) {
-    Serial.println("Missing cert/key files in /certs");
+    Serial.println("Missing cert/key files");
     return false;
   }
 
@@ -143,10 +135,6 @@ bool configureTLSFromFS() {
   secureClient.setCertificate(cert.c_str());
   secureClient.setPrivateKey(key.c_str());
   secureClient.setTimeout(5000);
-
-  // POC ONLY: disable hostname verification, because we're using IP but
-  // the broker cert CN is something like broker.example.local.
-  // Remove this and use proper DNS in a production setup.
   secureClient.setInsecure();
 
   Serial.println("TLS configured from LittleFS");
@@ -220,16 +208,25 @@ void publishAlert(const char* reason, float temperatureC) {
   }
 }
 
-void publishScan(const String& passkey) {
+void publishScanJson(const JsonObject& passkeyObj) {
   char topic[64];
   snprintf(topic, sizeof(topic), "boxes/%s/scan", BOX_ID);
 
-  StaticJsonDocument<512> doc;
+  // Create a larger document to include all passkey fields + metadata
+  StaticJsonDocument<1024> doc;
+  
+  // Add device timestamp and box_id
   doc["ts"] = (long)(millis() / 1000);
   doc["box_id"] = BOX_ID;
-  doc["passkey_string"] = passkey;  // ONLY passkey string + box_id
+  
+  // Copy all fields from the passkey JSON object
+  doc["order_id"] = passkeyObj["order_id"];
+  doc["role"] = passkeyObj["role"];
+  doc["passkey_string"] = passkeyObj["passkey_string"];
+  doc["created_timestamp"] = passkeyObj["created_timestamp"];
+  doc["expires_at"] = passkeyObj["expires_at"];
 
-  char payload[512];
+  char payload[2048];
   size_t n = serializeJson(doc, payload, sizeof(payload));
   if (!mqttClient.publish(topic, payload, n)) {
     Serial.println("Failed to publish scan");
@@ -244,9 +241,10 @@ void publishScan(const String& passkey) {
 /*
  * Parse Serial input to simulate a scan.
  * Expected format:
- *   SCAN <PASSKEY_STRING>
- * (For backward compatibility, we also accept "SCAN <ORDER_ID> <PASSKEY_STRING>"
- *  but ignore the ORDER_ID and only send passkey_string.)
+ *   SCAN <JSON_STRING>
+ * 
+ * Example:
+ *   SCAN {"order_id":"going","role":"sender","passkey_string":"eyJ...","created_timestamp":"...","expires_at":"..."}
  */
 void handleSerialScan() {
   if (!Serial.available()) return;
@@ -256,45 +254,50 @@ void handleSerialScan() {
   if (line.length() == 0) return;
 
   if (!line.startsWith("SCAN ")) {
-    Serial.println("Use: SCAN <PASSKEY_STRING>  or  SCAN <ORDER_ID> <PASSKEY_STRING>");
+    Serial.println("Use: SCAN <JSON_OBJECT>");
+    Serial.println("Example: SCAN {\"order_id\":\"going\",\"role\":\"sender\",\"passkey_string\":\"...\"}");
     return;
   }
 
-  // Split into tokens
-  int firstSpace = line.indexOf(' ');
-  if (firstSpace < 0) {
-    Serial.println("Invalid SCAN format");
+  // Extract JSON part after "SCAN "
+  String jsonStr = line.substring(5);
+  jsonStr.trim();
+
+  if (jsonStr.length() == 0) {
+    Serial.println("Invalid SCAN format: empty JSON");
     return;
   }
 
-  String rest = line.substring(firstSpace + 1);
-  rest.trim();
-
-  // If there is another space, assume "ORDER_ID PASSKEY"
-  int secondSpace = rest.indexOf(' ');
-  String passkey;
-  if (secondSpace < 0) {
-    // SCAN <PASSKEY>
-    passkey = rest;
-  } else {
-    // SCAN <ORDER_ID> <PASSKEY>
-    passkey = rest.substring(secondSpace + 1);
-  }
-  passkey.trim();
-
-  if (passkey.length() == 0) {
-    Serial.println("Invalid SCAN arguments (empty passkey).");
+  // Parse the JSON
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, jsonStr);
+  
+  if (error) {
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
     return;
   }
 
-  publishScan(passkey);
+  // Validate required fields
+  if (!doc.containsKey("passkey_string")) {
+    Serial.println("Invalid JSON: missing passkey_string");
+    return;
+  }
+
+  if (!doc.containsKey("order_id")) {
+    Serial.println("Warning: missing order_id in passkey JSON");
+  }
+
+  if (!doc.containsKey("role")) {
+    Serial.println("Warning: missing role in passkey JSON");
+  }
+
+  // Publish the complete JSON object
+  publishScanJson(doc.as<JsonObject>());
 }
 
 // ---------- RFID handling ----------
 
-// Convert UID to hex string and use it directly as passkey_string.
-// If your old code reads block data instead, you can replace this
-// with your previous "read passkey from tag" logic.
 String uidToHexString(MFRC522::Uid* uid) {
   String s;
   for (byte i = 0; i < uid->size; i++) {
@@ -305,10 +308,10 @@ String uidToHexString(MFRC522::Uid* uid) {
   return s;
 }
 
-// If you have more advanced logic (e.g., reading MIFARE blocks),
-// replace this function to return the correct passkey string.
+// For RFID tags, you could store the full passkey JSON on the tag
+// This function would need to be adapted based on your tag type
+// For now, it just returns the UID as a simple passkey_string
 String readPasskeyFromTag() {
-  // For now, we treat UID hex as passkey_string.
   return uidToHexString(&mfrc522.uid);
 }
 
@@ -317,24 +320,29 @@ void handleRfidScan() {
     return;
   }
 
-  String passkey = readPasskeyFromTag();
+  String uidStr = readPasskeyFromTag();
   unsigned long nowMs = millis();
 
   // Avoid retriggering rapidly for the same tag
-  if (passkey == lastRfidValue && (nowMs - lastRfidTimeMs) < RFID_RETRIGGER_MS) {
+  if (uidStr == lastRfidValue && (nowMs - lastRfidTimeMs) < RFID_RETRIGGER_MS) {
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
     return;
   }
 
-  lastRfidValue = passkey;
+  lastRfidValue = uidStr;
   lastRfidTimeMs = nowMs;
 
-  Serial.print("RFID tag detected, passkey_string = ");
-  Serial.println(passkey);
+  Serial.print("RFID tag detected, UID = ");
+  Serial.println(uidStr);
 
-  // NO lookup, NO order_id here. Just send passkey_string + box_id.
-  publishScan(passkey);
+  // For RFID, create a minimal passkey object with just the UID
+  // In production, you would read the full JSON from the tag
+  StaticJsonDocument<512> doc;
+  doc["passkey_string"] = uidStr;
+  // Note: order_id and role would need to be read from tag in production
+  
+  publishScanJson(doc.as<JsonObject>());
 
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
@@ -346,10 +354,10 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("ESP32 Edge starting (MQTT over TLS, keys in LittleFS, RFID + DS18B20, NO lookup)...");
+  Serial.println("ESP32 Edge starting (MQTT over TLS, Full Passkey JSON support)...");
 
   if (!configureTLSFromFS()) {
-    Serial.println("TLS configuration failed; check /certs files");
+    Serial.println("TLS configuration failed; check cert files");
   }
 
   connectWiFi();
@@ -367,6 +375,9 @@ void setup() {
   connectMQTT();
 
   lastTelemetryMs = millis();
+  
+  Serial.println("\nReady! Use serial command:");
+  Serial.println("SCAN {\"order_id\":\"going\",\"role\":\"sender\",\"passkey_string\":\"eyJ...\",\"created_timestamp\":\"...\",\"expires_at\":\"...\"}");
 }
 
 void loop() {

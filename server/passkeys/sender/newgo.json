@@ -1,0 +1,7 @@
+{
+  "order_id": "newgo",
+  "role": "sender",
+  "passkey_string": "eyJjcmVhdGVkX3RpbWVzdGFtcCI6IjIwMjUtMTEtMjRUMjM6MDI6NTUuNzQ4NTA0WiIsImV4cGlyZXNfYXQiOiIyMDI1LTExLTI1VDAwOjMyOjU1Ljc0ODUwNFoiLCJvcmRlcl9pZCI6Im5ld2dvIiwicm9sZSI6InNlbmRlciJ9.MEUCIDBikWq8XAja9nm5n7orbOehqtJN7_ULnVUBOS2j8bAvAiEAj6JHFgONbWlMNZJPhGfKUCfhz3Mjg6dAhA89jRswTkk",
+  "created_timestamp": "2025-11-24T23:02:55.748504Z",
+  "expires_at": "2025-11-25T00:32:55.748504Z"
+}
